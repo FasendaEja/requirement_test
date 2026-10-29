@@ -1,0 +1,6 @@
+{
+  "requirements": [
+    {"id": "JSON-001", "text": "Пароль пользователя хранится в виде хэша.", "verified": true},
+    {"id": "JSON-002", "text": "Система работает почти всегда.", "verified": false}
+  ]
+}

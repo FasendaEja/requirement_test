@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<requirements>
+  <requirement id="XML-001" priority="high">Система ведёт журнал действий пользователей.</requirement>
+  <requirement id="XML-002" priority="low">Интерфейс должен быть современным.</requirement>
+</requirements>
