@@ -14,10 +14,20 @@
   3. Сохраняет полученный от ИИ результат в файл вида
      "тестирование требований__ГГГГ-ММ-ДД_ЧЧ-ММ-СС.<расширение>"
      в папке OUTPUT_DIR.
+  4. После завершения тестирования формирует два отдельных артефакта:
+     - mind-map ("майнд-мапа__<дата_время>.md") — иерархическая карта
+       требований/проверок;
+     - чек-лист проверок ("чек-лист__<дата_время>.csv") — таблица со
+       столбцами: номер, описание проверки, результат (успешно/ошибка/др),
+       пример вводимого значения.
+     Оба артефакта генерируются отдельными запросами к ИИ (каждый запрос
+     дожидается полного ответа, обработка — только после ответа) с
+     фолбэком на локальный парсинг отчёта, если ИИ недоступен.
 
 Все параметры вынесены в файл .env (см. ENV_KEYS ниже).
 """
 
+import csv
 import json
 import os
 import re
@@ -70,6 +80,16 @@ OUTPUT_EXTENSION = os.getenv("OUTPUT_EXTENSION", ".md")
 TIMESTAMP_FORMAT = os.getenv("TIMESTAMP_FORMAT", "%Y-%m-%d_%H-%M-%S")
 
 MAX_FILE_CHARS = int(os.getenv("MAX_FILE_CHARS", "0"))  # 0 = без ограничения
+
+# --- Генерация mind-map и чек-листа после завершения тестирования ---
+GENERATE_MINDMAP = os.getenv("GENERATE_MINDMAP", "true").strip().lower() in ("1", "true", "yes", "on", "да")
+GENERATE_CHECKLIST = os.getenv("GENERATE_CHECKLIST", "true").strip().lower() in ("1", "true", "yes", "on", "да")
+MINDMAP_PROMPT_FILE = _resolve(Path(os.getenv("MINDMAP_PROMPT_FILE", "prompt_mindmap.txt")))
+CHECKLIST_PROMPT_FILE = _resolve(Path(os.getenv("CHECKLIST_PROMPT_FILE", "prompt_checklist.txt")))
+MINDMAP_PREFIX = os.getenv("MINDMAP_PREFIX", "майнд-мапа__")
+MINDMAP_EXTENSION = os.getenv("MINDMAP_EXTENSION", ".md")
+CHECKLIST_PREFIX = os.getenv("CHECKLIST_PREFIX", "чек-лист__")
+CHECKLIST_EXTENSION = os.getenv("CHECKLIST_EXTENSION", ".csv")
 
 
 # ------------------------------ Чтение файлов -------------------------------
@@ -265,9 +285,9 @@ def build_requirements_payload(files: list[Path], root: Path) -> str:
 
 # ------------------------------ Работа с ИИ ---------------------------------
 
-def ask_ai(prompt_text: str, requirements_text: str) -> str:
+def ask_ai_raw(user_message: str, label: str) -> str:
     """
-    Синхронный запрос к ИИ через OpenAI-совместимый API.
+    Низ-level синхронный запрос к ИИ через OpenAI-совместимый API.
 
     Функция возвращает управление ТОЛЬКО после того, как модель вернёт
     полный ответ (stream=False, обычный blocking-вызов). Обработка
@@ -278,16 +298,10 @@ def ask_ai(prompt_text: str, requirements_text: str) -> str:
 
     client = OpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL, timeout=TIMEOUT)
 
-    user_message = (
-        f"{prompt_text}\n\n"
-        f"Ниже приведено содержимое файлов с требованиями.\n\n"
-        f"{requirements_text}"
-    )
-
     last_error = None
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            print(f"[Запрос #{attempt}] Отправка данных в ИИ "
+            print(f"[{label}: запрос #{attempt}] Отправка данных в ИИ "
                   f"(модель: {MODEL}, temperature={TEMPERATURE}, max_tokens={MAX_TOKENS})...")
             completion = client.chat.completions.create(
                 model=MODEL,
@@ -300,16 +314,26 @@ def ask_ai(prompt_text: str, requirements_text: str) -> str:
                 ],
             )
             answer = (completion.choices[0].message.content or "").strip()
-            print("[ОТВЕТ ПОЛУЧЕН] ИИ вернул полный ответ, начинаю обработку результата.")
+            print(f"[{label}: ОТВЕТ ПОЛУЧЕН] ИИ вернул полный ответ, начинаю обработку результата.")
             return answer
         except Exception as e:
             last_error = e
-            print(f"[Ошибка] Попытка {attempt}/{MAX_RETRIES} не удалась: {e}")
+            print(f"[{label}: ошибка] Попытка {attempt}/{MAX_RETRIES} не удалась: {e}")
             if attempt < MAX_RETRIES:
                 delay = RETRY_DELAY * attempt
                 print(f"Повтор через {delay:.0f} с...")
                 time.sleep(delay)
-    raise RuntimeError(f"Не удалось получить ответ от ИИ после {MAX_RETRIES} попыток: {last_error}")
+    raise RuntimeError(f"Не удалось получить ответ от ИИ ({label}) после {MAX_RETRIES} попыток: {last_error}")
+
+
+def ask_ai(prompt_text: str, requirements_text: str) -> str:
+    """Запрос на тестирование требований: промт из файла + содержимое файлов."""
+    user_message = (
+        f"{prompt_text}\n\n"
+        f"Ниже приведено содержимое файлов с требованиями.\n\n"
+        f"{requirements_text}"
+    )
+    return ask_ai_raw(user_message, "Тестирование требований")
 
 
 # ------------------------------ Сохранение ----------------------------------
@@ -330,6 +354,263 @@ def save_result(answer: str, files_count: int) -> Path:
     )
     out_path.write_text(header + answer, encoding="utf-8")
     return out_path
+
+
+# ------------------- Mind-map и чек-лист проверок ---------------------------
+
+CHECKLIST_HEADER = ["Номер", "Описание проверки", "Результат", "Пример вводимого значения"]
+
+# Нормализация вариантов результата к единому виду.
+_RESULT_MAP = {
+    "успешно": "успешно", "pass": "успешно", "ok": "успешно", "пройдено": "успешно",
+    "успех": "успешно", "да": "успешно", "соответствует": "успешно",
+    "ошибка": "ошибка", "fail": "ошибка", "failed": "ошибка", "провал": "ошибка",
+    "не пройдено": "ошибка", "не соответствует": "ошибка", "нет": "ошибка", "дефект": "ошибка",
+    "не применимо": "не применимо", "n/a": "не применимо", "na": "не применимо",
+    "не требуется": "не применимо",
+    "требуется уточнение": "требуется уточнение", "уточнить": "требуется уточнение",
+    "unknown": "требуется уточнение", "неизвестно": "требуется уточнение",
+    "?": "требуется уточнение",
+}
+
+
+def normalize_result(value: str) -> str:
+    v = (value or "").strip().lower().replace("*", "").replace("`", "")
+    if not v:
+        return "требуется уточнение"
+    if v in _RESULT_MAP:
+        return _RESULT_MAP[v]
+    for key, norm in _RESULT_MAP.items():
+        if key and key in v:
+            return norm
+    return value.strip()  # нестандартное значение сохраняем как есть
+
+
+def strip_code_fences(text: str) -> str:
+    """Удаляет обрамляющие markdown-блоки ``` ... ``` из ответа ИИ."""
+    m = re.search(r"```[a-zA-Z0-9_-]*\s*(.*?)\s*```", text, flags=re.S)
+    if m and len(m.group(1).strip()) > 10:
+        return m.group(1).strip()
+    return text.strip()
+
+
+def load_aux_prompt(path: Path, default: str) -> str:
+    """Читает промт из файла; если файла нет — использует встроенный default."""
+    try:
+        if path.exists():
+            return path.read_text(encoding="utf-8").strip()
+    except Exception as e:
+        print(f"[Внимание] Не удалось прочитать промт {path}: {e}. Использую встроенный.")
+    return default
+
+
+def ask_ai_or_fallback(user_message: str, label: str, fallback: str) -> str:
+    """Запрос к ИИ; при недоступности модели — локальный фолбэк-результат."""
+    try:
+        return ask_ai_raw(user_message, label)
+    except Exception as e:
+        print(f"[Внимание] {label}: ИИ недоступен ({e}). Использую локальную генерацию.")
+        return fallback
+
+
+def build_mindmap(report_text: str, requirements_text: str) -> str:
+    """Формирует mind-map по результатам тестирования (запрос к ИИ + фолбэк)."""
+    default_prompt = (
+        "По приведённому отчёту тестирования требований и тексту требований построй "
+        "mind-map в формате Markdown-списка с отступами (2 пробела на уровень): "
+        "корень — название системы/набора требований; ветви верхнего уровня — темы "
+        "(требования, дефекты, риски, вопросы заказчику); далее — конкретные пункты. "
+        "Для каждого требования укажи статус проверки (успешно / ошибка / требуется "
+        "уточнение). Верни ТОЛЬКО mind-map без пояснительного текста."
+    )
+    prompt_text = load_aux_prompt(MINDMAP_PROMPT_FILE, default_prompt)
+    user_message = (
+        f"{prompt_text}\n\n=== ОТЧЁТ ПО РЕЗУЛЬТАТАМ ТЕСТИРОВАНИЯ ТРЕБОВАНИЙ ===\n{report_text}"
+        f"\n\n=== ИСХОДНЫЕ ТРЕБОВАНИЯ ===\n{requirements_text}"
+    )
+    fallback = (
+        "# Тестирование требований\n"
+        "## Требования\n- см. отчёт (автоматическая декомпозиция недоступна)\n"
+        "## Дефекты\n- см. таблицу дефектов отчёта\n"
+        "## Вопросы заказчику\n- см. раздел «Вопросы заказчику» отчёта\n"
+    )
+    return strip_code_fences(ask_ai_or_fallback(user_message, "Mind-map", fallback))
+
+
+def save_mindmap(mindmap_text: str) -> Path:
+    """Сохранение mind-map в отдельный файл 'майнд-мапа__<дата_время>.md'."""
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
+    out_path = OUTPUT_DIR / f"{MINDMAP_PREFIX}{timestamp}{MINDMAP_EXTENSION}"
+    content = mindmap_text
+    if not content.lstrip().startswith("#"):
+        content = "# Mind-map: тестирование требований\n\n" + content
+    out_path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    return out_path
+
+
+def parse_checklist_rows(text: str) -> list[list[str]]:
+    """Парсит строки чек-листа из CSV (';' или ',') либо markdown-таблицы (4 колонки)."""
+    rows: list[list[str]] = []
+    # Ответ ИИ может быть обёрнут в markdown-блок ``` ... ``` — снимаем его.
+    text = strip_code_fences(text)
+
+    def add_row(cells: list[str]):
+        if not re.match(r"^\d+", cells[0]):
+            return  # пропускаем заголовки и служебные строки
+        num = re.sub(r"[^\d].*$", "", cells[0]) or str(len(rows) + 1)
+        desc, result, example = cells[1], normalize_result(cells[2]), cells[3]
+        if desc:
+            rows.append([num, desc, result, example])
+
+    # 1) Markdown-таблица (разбирается первой — её проще детектировать).
+    md_rows: list[list[str]] = []
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith("|") and s.count("|") >= 3:
+            cells = [c.strip() for c in s.strip("|").split("|")]
+            if cells and all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
+                continue  # строка-разделитель |---|---|
+            if len(cells) >= 4:
+                md_rows.append(cells[:4])
+    for cells in md_rows:
+        add_row(cells)
+    if rows:
+        return rows
+
+    # 2) CSV. Разделитель не угадываем по тексту (кавычки мешают), а
+    # перебираем варианты: ';' , ',' , '\t'. Для каждого варианта строки
+    # с «неполным» числом колонок склеиваются со следующmи (многострочные
+    # ячейки в кавычках csv.reader объединит сам).
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    best: list[list[str]] = []
+    for delim in (";", ",", "\t"):
+        parsed: list[list[str]] = []
+        buf = ""
+        for ln in lines:
+            candidate = (buf + "\n" + ln) if buf else ln
+            recs = list(csv.reader(candidate.splitlines(), delimiter=delim))
+            if recs and len(recs[0]) >= 4:
+                parsed.extend([r for r in recs if len(r) >= 4])
+                buf = ""
+            else:
+                buf = candidate
+        scored = [cells[:4] for cells in parsed if len(cells) >= 4]
+        if len(scored) > len(best):
+            best = scored
+    for cells in best:
+        add_row(cells)
+    return rows
+
+
+def clean_md(s: str) -> str:
+    """Убирает markdown-разметку из строки."""
+    s = re.sub(r"\*\*|__|`", "", s or "")
+    return s.replace("\n", " ").strip()
+
+
+def fallback_checklist_rows(report_text: str) -> list[list[str]]:
+    """Локальная сборка чек-листа из markdown-таблицы дефектов отчёта."""
+    rows: list[list[str]] = []
+    for line in report_text.splitlines():
+        s = line.strip()
+        if not (s.startswith("|") and s.count("|") >= 4):
+            continue
+        cells = [c.strip() for c in s.strip("|").split("|")]
+        # Дефекты описываются таблицей из 6 колонок (№|Файл|Требование|Тип|Описание|Рекомендация).
+        if len(cells) < 6 or not re.match(r"^\d+", cells[0]):
+            continue
+        file_ref, req, problem, description, recommendation = cells[1:6]
+        low_problem = problem.lower()
+        low_all = " ".join(c.lower() for c in cells)
+        if any(k in low_all for k in ("проверить", "валидировать")):
+            continue  # это уже строка чек-листа, а не таблица дефектов отчёта
+        if any(k in low_problem for k in ("отсутств", "неполн", "противореч", "неоднозначн")):
+            result = "ошибка"
+        elif any(k in low_problem for k in ("непроверяем", "неясн", "нечётк", "термин", "неопредел")):
+            result = "требуется уточнение"
+        else:
+            result = "не применимо"
+        source = file_ref if file_ref and file_ref != "-" else "документ требований"
+        desc = (
+            f"Проверить требование «{clean_md(req)}» ({source}): {clean_md(description)}. "
+            f"Рекомендация: {clean_md(recommendation) or 'см. отчёт'}."
+        )
+        rows.append([str(len(rows) + 1), desc, result, "см. отчёт тестирования"])
+    return rows
+
+
+def generate_checklist(report_text: str, requirements_text: str) -> tuple[list[list[str]], str]:
+    """
+    Формирует чек-лист проверок: запрос к ИИ, затем разбор его ответа.
+    При недоступности ИИ или нераспознанном формате — локальный фолбэк
+    (парсинг таблицы дефектов из отчёта). Возвращает (строки, сырой ответ ИИ).
+    """
+    default_prompt = (
+        "На основе отчёта тестирования требований составь чек-лист проверок. "
+        "Верни СТРОГО CSV-таблицу с точкой с запятой (;) как разделителем и заголовком:\n"
+        "Номер;Описание проверки;Результат;Пример вводимого значения\n\n"
+        "Правила:\n"
+        "- Каждое требование и каждый дефект из отчёта — отдельная строка чек-листа.\n"
+        "- Колонка «Результат» — одно из: успешно, ошибка, не применимо, требуется уточнение "
+        "(требование пройдено / выявлен дефект / проверка неприменима / нужна информация).\n"
+        "- В «Пример вводимого значения» указывай конкретные тестовые данные (валидные и "
+        "граничные), либо «нет данных», если пример вывести нельзя.\n"
+        "- Описания — на русском языке, без переносов строк внутри ячеек.\n"
+        "- Никакого текста вне CSV-таблицы."
+    )
+    prompt_text = load_aux_prompt(CHECKLIST_PROMPT_FILE, default_prompt)
+    user_message = (
+        f"{prompt_text}\n\n=== ОТЧЁТ ПО РЕЗУЛЬТАТАМ ТЕСТИРОВАНИЯ ТРЕБОВАНИЙ ===\n{report_text}"
+        f"\n\n=== ИСХОДНЫЕ ТРЕБОВАНИЯ ===\n{requirements_text}"
+    )
+    answer = ask_ai_or_fallback(user_message, "Чек-лист", "")
+    rows = parse_checklist_rows(answer) if answer else []
+    if rows:
+        print(f"[Чек-лист] Разобрано строк из ответа ИИ: {len(rows)}")
+        return rows, answer
+    if answer:
+        print("[Внимание] Ответ ИИ не распознан как таблица — собираю чек-лист из отчёта локально.")
+    return fallback_checklist_rows(report_text), answer
+
+
+def save_checklist(rows: list[list[str]], raw_ai_answer: str = "") -> list[Path]:
+    """
+    Сохранение чек-листа отдельными файлами: CSV-таблица (для Excel) и
+    markdown-таблица (для просмотра). Возвращает список созданных файлов.
+    """
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime(TIMESTAMP_FORMAT)
+    saved: list[Path] = []
+
+    # 1) CSV: разделитель ';', UTF-8 BOM — корректно открывается в Excel.
+    csv_path = OUTPUT_DIR / f"{CHECKLIST_PREFIX}{timestamp}{CHECKLIST_EXTENSION}"
+    with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+        writer = csv.writer(f, delimiter=";", quoting=csv.QUOTE_MINIMAL)
+        writer.writerow(CHECKLIST_HEADER)
+        writer.writerows(rows)
+    saved.append(csv_path)
+
+    # 2) Markdown-таблица с теми же столбцами.
+    md_path = OUTPUT_DIR / f"{CHECKLIST_PREFIX}{timestamp}.md"
+    lines = [
+        "# Чек-лист проверок требований\n",
+        f"- Дата и время формирования: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+        f"- Проверок в чек-листе: {len(rows)}\n",
+    ]
+    if rows:
+        lines.append("| " + " | ".join(CHECKLIST_HEADER) + " |")
+        lines.append("|" + "---|" * len(CHECKLIST_HEADER))
+        for r in rows:
+            safe = [clean_md(c).replace("|", "\\|") for c in r]
+            lines.append("| " + " | ".join(safe) + " |")
+    else:
+        lines.append("_Чек-лист пуст: не удалось извлечь проверки из ответа ИИ и отчёта._")
+    if raw_ai_answer and not rows:
+        lines.append("\n## Сырой ответ ИИ\n\n" + raw_ai_answer)
+    md_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    saved.append(md_path)
+    return saved
 
 
 # --------------------------------- main -------------------------------------
@@ -376,7 +657,26 @@ def main() -> int:
     # Шаг 3. Обработка и сохранение результата — только после получения ответа.
     out_path = save_result(answer, len(files))
     print(f"\n[Шаг 3] Результат ИИ сохранён в файл: {out_path}")
-    print("Готово.")
+
+    # Шаг 4. После завершения тестирования — mind-map и чек-лист (отдельные файлы).
+    # Каждый подзапрос также дожидается полного ответа ИИ перед обработкой.
+    if GENERATE_MINDMAP or GENERATE_CHECKLIST:
+        print("\n[Шаг 4] Формирование дополнительных артефактов по результатам тестирования...")
+
+    if GENERATE_MINDMAP:
+        mindmap_text = build_mindmap(answer, requirements_text)
+        mm_path = save_mindmap(mindmap_text)
+        print(f"[Шаг 4] Mind-map сохранена в файл: {mm_path}")
+
+    if GENERATE_CHECKLIST:
+        rows, raw = generate_checklist(answer, requirements_text)
+        if not rows:
+            print("[Внимание] Чек-лист получился пустым — сохраняю только сырой ответ ИИ.")
+        paths = save_checklist(rows, raw)
+        for p in paths:
+            print(f"[Шаг 4] Чек-лист сохранён в файл: {p}")
+
+    print("\nГотово.")
     return 0
 
 
